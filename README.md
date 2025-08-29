@@ -12,6 +12,9 @@ A Node.js/Express server that provides web push notifications for Blobbi status 
 ## Features
 
 - Web push subscription management with npub support
+- Instant confirmation notifications upon successful subscription
 - Real-time Nostr monitoring for kind 31124 events (Blobbi status)
-- Smart notification system with rate limiting (60min dedupe per endpoint)
+- Periodic re-notification system for persistent low Blobbi status
+- Smart escalation detection (care → serious care) with immediate alerts
+- Rate limiting and endpoint-level deduplication
 - Automatic reconnection to Nostr relays with exponential backoff

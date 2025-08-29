@@ -344,27 +344,27 @@ function markMessageSent(endpoint, messageKey) {
 
 async function sendPushNotification(endpoint, p256dh, auth, title, body, data = {}) {
   try {
-    const subscription = {
-      endpoint,
-      keys: { p256dh, auth }
-    };
-    
-    const sev = (data && data.severity) || "care";
+    const subscription = { endpoint, keys: { p256dh, auth } };
+
+    const sev = data?.severity || "care";
+    const tag = (data?.tag) ?? `blobbi-status:${sev}`;
+    const renotify = (typeof data?.renotify === "boolean")
+      ? data.renotify
+      : (sev === "serious"); // padrão: só renotify em “serious”
+
     const payload = JSON.stringify({
       title,
       body,
-      data,
-      tag: `blobbi-status:${sev}`,
-      renotify: true,
+      data: { ...data, timestamp: data?.timestamp ?? Date.now() },
+      tag,
+      renotify,
       timestamp: Date.now()
     });
-    
+
     await webpush.sendNotification(subscription, payload);
     return true;
   } catch (error) {
     console.error("Push notification failed:", error.message);
-    
-    // Remove invalid subscriptions
     if (error.statusCode === 404 || error.statusCode === 410) {
       try {
         await pool.query("DELETE FROM webpush_subscriptions WHERE endpoint = $1", [endpoint]);
@@ -647,6 +647,7 @@ app.get("/vapid-public-key", (req, res) => {
 app.post("/subscribe", async (req, res) => {
   try {
     const { subscription, npub, segment, label } = req.body;
+    console.log(`📝 New subscription request: npub=${npub ? npub.slice(0, 16) + '...' : 'none'}, segment=${segment}`);
     
     if (!subscription || !subscription.endpoint || !subscription.keys) {
       return res.status(400).json({ error: "Invalid subscription object" });
@@ -664,6 +665,7 @@ app.post("/subscribe", async (req, res) => {
       return res.status(400).json({ error: "Invalid npub format" });
     }
     
+    // Use a more reliable method to detect new vs updated subscriptions
     const result = await pool.query(`
       INSERT INTO webpush_subscriptions (endpoint, p256dh, auth, ua, segment, npub, label, updated_at)
       VALUES ($1, $2, $3, $4, $5, $6, $7, now())
@@ -676,18 +678,57 @@ app.post("/subscribe", async (req, res) => {
         npub = EXCLUDED.npub,
         label = EXCLUDED.label,
         updated_at = now()
-      RETURNING id, endpoint
+      RETURNING id, endpoint, created_at, updated_at
     `, [endpoint, p256dh, auth, req.headers["user-agent"], segment, npub, label]);
+    
+    // Check if this was a new subscription by comparing created_at and updated_at
+    const subscriptionRecord = result.rows[0];
+    const isNewSubscription = Math.abs(new Date(subscriptionRecord.created_at) - new Date(subscriptionRecord.updated_at)) < 1000; // Within 1 second
     
     // Update active subscriptions if npub was provided
     if (npub) {
       await updateActiveSubscriptions();
     }
     
+    // Send immediate confirmation push notification only for new subscriptions
+    if (isNewSubscription) {
+      try {
+        console.log(`📤 Sending confirmation notification to new subscriber: ${endpoint.slice(-20)}...`);
+        
+        const confirmationSuccess = await sendPushNotification(
+          endpoint,
+          p256dh,
+          auth,
+          "Blobbi Notifications",
+          "Notifications enabled! You'll receive alerts when your Blobbies need care.",
+          { 
+            type: "confirmation",
+            tag: "blobbi-confirmation",
+            renotify: false,
+            timestamp: Date.now(),
+            icon: "/icon-192x192.png",
+            badge: "/badge-72x72.png"
+          }
+        );
+        
+        if (confirmationSuccess) {
+          console.log(`✅ Successfully sent confirmation notification to: ${endpoint.slice(-20)}...`);
+        } else {
+          console.log(`⚠️ Failed to send confirmation notification to: ${endpoint.slice(-20)}...`);
+        }
+      } catch (confirmationError) {
+        console.error("❌ Confirmation notification error:", confirmationError.message);
+        // Don't fail the subscription if confirmation fails
+      }
+    } else {
+      console.log(`🔄 Updated existing subscription: ${endpoint.slice(-20)}...`);
+    }
+    
     res.json({
       ok: true,
-      id: result.rows[0].id,
-      endpoint: result.rows[0].endpoint
+      id: subscriptionRecord.id,
+      endpoint: subscriptionRecord.endpoint,
+      isNew: isNewSubscription
     });
   } catch (error) {
     console.error("Subscribe error:", error.message);
@@ -825,6 +866,83 @@ app.post("/admin/poll-now", async (req, res) => {
     await pollNostrOnce();
     await tickNotifications();
     res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Test endpoint to send confirmation notifications to all subscribers
+app.post("/admin/test-confirmation", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM webpush_subscriptions WHERE muted = FALSE LIMIT 10"
+    );
+    
+    let successCount = 0;
+    for (const subscription of result.rows) {
+      try {
+        const success = await sendPushNotification(
+          subscription.endpoint,
+          subscription.p256dh,
+          subscription.auth,
+          "Blobbi Test",
+          "Test confirmation notification - your push notifications are working!",
+          { type: "test", timestamp: Date.now() }
+        );
+        if (success) successCount++;
+      } catch (error) {
+        console.error(`Failed to send test notification to ${subscription.endpoint.slice(-20)}:`, error.message);
+      }
+    }
+    
+    res.json({ 
+      ok: true, 
+      sent: successCount, 
+      total: result.rows.length,
+      message: `Sent test confirmations to ${successCount}/${result.rows.length} subscribers`
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Manual confirmation test endpoint
+app.post("/admin/send-confirmation", async (req, res) => {
+  try {
+    const { endpoint } = req.body;
+    
+    if (!endpoint) {
+      return res.status(400).json({ error: "Missing endpoint parameter" });
+    }
+    
+    const result = await pool.query(
+      "SELECT * FROM webpush_subscriptions WHERE endpoint = $1",
+      [endpoint]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Subscription not found" });
+    }
+    
+    const subscription = result.rows[0];
+    const success = await sendPushNotification(
+      subscription.endpoint,
+      subscription.p256dh,
+      subscription.auth,
+      "Blobbi Notifications",
+      "Notifications enabled! You'll receive alerts when your Blobbies need care.",
+      { 
+        type: "confirmation",
+        tag: "blobbi-confirmation",
+        renotify: false,
+        timestamp: Date.now()
+      }
+    );
+    
+    res.json({ 
+      ok: success,
+      message: success ? "Confirmation sent successfully" : "Failed to send confirmation"
+    });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }

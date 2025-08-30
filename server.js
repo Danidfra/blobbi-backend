@@ -55,6 +55,12 @@ function npubToHex(npub) {
   }
 }
 
+function parseBool(v) {
+  if (typeof v === 'boolean') return v;
+  const s = String(v).toLowerCase().trim();
+  return s === '1' || s === 'true' || s === 'yes';
+}
+
 async function loadActiveAuthorsHex() {
   const rows = await pool.query(
     "SELECT DISTINCT npub FROM webpush_subscriptions WHERE npub IS NOT NULL AND muted = FALSE"
@@ -174,7 +180,8 @@ function extractBlobbiIdAndName(event) {
  * @returns {Map} npub -> Map(blobbiId -> { name, statuses })
  */
 function collectStatusesByBlobbi(events) {
-  const result = new Map(); // npub -> Map(blobbiId -> { name, statuses })
+  const result = new Map(); // npub -> Map(blobbiId -> { name, base, real, lastUpdate, lastInteraction })
+  const nowSec = Math.floor(Date.now() / 1000);
 
   for (const event of events) {
     const npub = nip19.npubEncode(event.pubkey);
@@ -186,24 +193,28 @@ function collectStatusesByBlobbi(events) {
     
     const userBlobbies = result.get(npub);
     
-    // Parse statuses
-    const statuses = {};
+    // Parse base statuses
+    const baseStatuses = {};
+    let isSleeping = false; // Track is_sleeping separately
 
     const setMetric = (key, raw) => {
       if (key === "awake") {
-        const s = String(raw).toLowerCase();
-        statuses.awake = (s === "1" || s === "true");
+        baseStatuses.awake = parseBool(raw);
+        return;
+      }
+      if (key === "is_sleeping") {
+        isSleeping = parseBool(raw);
         return;
       }
       const normalized = normalizeValue(raw);
-      if (normalized !== null) statuses[key] = normalized;
+      if (normalized !== null) baseStatuses[key] = normalized;
     };
 
     // Process tags
     for (const tag of event.tags || []) {
       if (tag.length >= 2) {
         const [key, value] = tag;
-        if (["health", "energy", "hygiene", "happiness", "hunger", "awake"].includes(key)) {
+        if (["health", "energy", "hygiene", "happiness", "hunger", "awake", "is_sleeping"].includes(key)) {
           setMetric(key, value);
         }
       }
@@ -213,7 +224,7 @@ function collectStatusesByBlobbi(events) {
     try {
       const content = JSON.parse(event.content || "{}");
       for (const [key, value] of Object.entries(content)) {
-        if (["health", "energy", "hygiene", "happiness", "hunger", "awake"].includes(key)) {
+        if (["health", "energy", "hygiene", "happiness", "hunger", "awake", "is_sleeping"].includes(key)) {
           setMetric(key, value);
         }
       }
@@ -221,12 +232,45 @@ function collectStatusesByBlobbi(events) {
       // Content is not valid JSON
     }
 
+    // Apply is_sleeping override: if is_sleeping=true, force awake=false
+    if (isSleeping) {
+      baseStatuses.awake = false;
+    }
+
+    // Extract last_interaction and stage
+    const lastInteraction = extractLastInteraction(event);
+    const stage = extractStage(event);
+
+    // Calculate hours since last interaction
+    let hours = 0;
+    if (lastInteraction !== null) {
+      const timeDiff = nowSec - lastInteraction;
+      if (timeDiff < 0) {
+        console.warn(`⚠️ Last interaction is in the future for blobbi ${blobbiId}: ${lastInteraction} > ${nowSec}`);
+        hours = 0;
+      } else {
+        hours = Math.max(0, timeDiff / 3600);
+      }
+    } else {
+      console.warn(`⚠️ Missing last_interaction for blobbi ${blobbiId}, skipping decay`);
+    }
+
+    // Apply decay to get real stats
+    const realStatuses = lastInteraction !== null 
+      ? applyDecay(baseStatuses, hours, stage, baseStatuses.awake !== false)
+      : { ...baseStatuses }; // Fallback to base stats if no last_interaction
+
     // Store or update the Blobbi
     if (!userBlobbies.has(blobbiId) || event.created_at > (userBlobbies.get(blobbiId).lastUpdate || 0)) {
       userBlobbies.set(blobbiId, {
         name: blobbiName,
-        statuses,
-        lastUpdate: event.created_at
+        base: baseStatuses,
+        real: realStatuses,
+        lastUpdate: event.created_at,
+        lastInteraction: lastInteraction,
+        stage: stage,
+        hoursSinceInteraction: hours,
+        isSleeping: isSleeping
       });
     }
   }
@@ -236,15 +280,15 @@ function collectStatusesByBlobbi(events) {
 
 /**
  * Computes notification decision for a user based on their Blobbies
- * @param {Map} blobbies - Map(blobbiId -> { name, statuses })
+ * @param {Map} blobbies - Map(blobbiId -> { name, real, base, hoursSinceInteraction, stage })
  * @returns {string|null} Notification message or null if no notification needed
  */
 function computeGroupDecision(blobbies) {
   const blobbiesBelow60 = [];
   const blobbiesBelow30 = [];
 
-  for (const [blobbiId, { name, statuses }] of blobbies) {
-    const { health, energy, hygiene, happiness, hunger, awake } = statuses;
+  for (const [blobbiId, { name, real, base, hoursSinceInteraction, stage }] of blobbies) {
+    const { health, energy, hygiene, happiness, hunger, awake } = real;
     
     // Collect valid values (energy only counts if awake !== false)
     const values = [];
@@ -319,6 +363,132 @@ function computeGroupDecision(blobbies) {
 
 function createMessageKey(message) {
   return Buffer.from(message).toString("base64").slice(0, 32);
+}
+
+/**
+ * Clamps a value between min and max
+ */
+function clamp(value, min = 0, max = 100) {
+  return Math.min(Math.max(value, min), max);
+}
+
+/**
+ * Applies time-based decay to Blobbi stats
+ * @param {Object} base - Base stats from event
+ * @param {number} hours - Hours since last interaction
+ * @param {string} stage - Blobbi stage ('egg', 'baby', 'adult')
+ * @param {boolean} awake - Whether Blobbi is awake
+ * @returns {Object} Real stats after decay
+ */
+function applyDecay(base, hours, stage = 'adult', awake = true) {
+  const real = { ...base };
+  
+  if (stage === 'baby' || stage === 'adult') {
+    const isBaby = stage === 'baby';
+    
+    // Per-hour decay rates
+    const hungerRate = isBaby ? -5 : -4;
+    const happyRate = -3;
+    const hygieneRate = -4;
+    const energyRateAwake = isBaby ? -6 : -5;
+    const energyRateSleep = +4;
+    
+    // Apply decay to each stat
+    real.hunger = clamp(base.hunger + hungerRate * hours);
+    real.happiness = clamp(base.happiness + happyRate * hours);
+    real.hygiene = clamp(base.hygiene + hygieneRate * hours);
+    real.energy = clamp(base.energy + (awake === false ? energyRateSleep : energyRateAwake) * hours);
+    
+    // Health calculation (use real stats for regeneration check as per requirements)
+    const allGoodForRegen = 
+      real.hunger >= 80 &&
+      real.hygiene >= 80 &&
+      real.energy >= 80 &&
+      real.happiness >= 80;
+    
+    if (allGoodForRegen) {
+      // Health regeneration
+      real.health = clamp(base.health + (+2.0) * hours);
+    } else {
+      // Health baseline decay + modifiers
+      let healthDelta = -1.0; // baseline
+      if (real.hunger < 30) healthDelta -= 1.5;
+      if (real.hygiene < 20) healthDelta -= 1.0;
+      if (real.energy < 20) healthDelta -= 1.0;
+      if (real.happiness < 30) healthDelta -= 1.0;
+      real.health = clamp(base.health + healthDelta * hours);
+    }
+  } else if (stage === 'egg') {
+    // Egg stage decay (if needed)
+    // For now, keep stats as-is until egg stage is commonly used
+    console.log(`🥚 Egg stage decay not yet implemented for blobbi`);
+  }
+  
+  return real;
+}
+
+/**
+ * Extracts last_interaction from event
+ * @param {Object} event - Nostr event
+ * @returns {number|null} Unix timestamp or null if not found
+ */
+function extractLastInteraction(event) {
+  // Check tags first
+  for (const tag of event.tags || []) {
+    if (tag.length >= 2 && tag[0] === 'last_interaction') {
+      const timestamp = parseInt(tag[1]);
+      if (!isNaN(timestamp)) {
+        return timestamp;
+      }
+    }
+  }
+  
+  // Check content JSON
+  try {
+    const content = JSON.parse(event.content || '{}');
+    if (content.last_interaction) {
+      const timestamp = parseInt(content.last_interaction);
+      if (!isNaN(timestamp)) {
+        return timestamp;
+      }
+    }
+  } catch (error) {
+    // Content is not valid JSON
+  }
+  
+  return null;
+}
+
+/**
+ * Extracts stage from event
+ * @param {Object} event - Nostr event
+ * @returns {string} Stage ('egg', 'baby', 'adult') - defaults to 'adult'
+ */
+function extractStage(event) {
+  // Check tags first
+  for (const tag of event.tags || []) {
+    if (tag.length >= 2 && tag[0] === 'stage') {
+      const stage = tag[1].toLowerCase();
+      if (['egg', 'baby', 'adult'].includes(stage)) {
+        return stage;
+      }
+    }
+  }
+  
+  // Check content JSON
+  try {
+    const content = JSON.parse(event.content || '{}');
+    if (content.stage) {
+      const stage = content.stage.toLowerCase();
+      if (['egg', 'baby', 'adult'].includes(stage)) {
+        return stage;
+      }
+    }
+  } catch (error) {
+    // Content is not valid JSON
+  }
+  
+  return 'adult'; // default
 }
 
 const RATE_LIMIT_MS = Number(process.env.RATE_LIMIT_MS || MONITOR_INTERVAL_MS);
@@ -579,13 +749,13 @@ async function processNostrEvents(events) {
   // Process each user
   for (const [npub, blobbies] of statusesByNpub) {
     try {
-      // Count Blobbies that need care
+      // Count Blobbies that need care (using real stats)
       let countBelow60 = 0;
       let countBelow30 = 0;
-      const blobbiNames = [];
+      const blobbiInfo = [];
 
-      for (const [blobbiId, { name, statuses }] of blobbies) {
-        const { health, energy, hygiene, happiness, hunger, awake } = statuses;
+      for (const [blobbiId, { name, real, base, hoursSinceInteraction, stage }] of blobbies) {
+        const { health, energy, hygiene, happiness, hunger, awake } = real;
         
         // Collect valid values (energy only counts if awake !== false)
         const values = [];
@@ -600,16 +770,28 @@ async function processNostrEvents(events) {
 
         if (hasBelow60) {
           countBelow60++;
-          blobbiNames.push(name);
         }
         if (hasBelow30) {
           countBelow30++;
         }
+
+        // Collect blobbi info for logging
+        blobbiInfo.push({
+          name,
+          hours: hoursSinceInteraction,
+          stage,
+          hasBelow60,
+          hasBelow30
+        });
       }
 
-      // Log status counts
+      // Log status counts with decay info
       if (countBelow60 > 0 || countBelow30 > 0) {
-        console.log(`📊 ${npub}: ${blobbies.size} blobbies | ${countBelow60} <60 | ${countBelow30} <30`);
+        const decayInfo = blobbiInfo
+          .filter(b => b.hasBelow60 || b.hasBelow30)
+          .map(b => `${b.name}(h=${b.hours?.toFixed(1)},s=${b.stage})`)
+          .join(', ');
+        console.log(`📊 [stream] ${npub}: ${blobbies.size} blobbies | ${countBelow60} <60 | ${countBelow30} <30 (computed with decay: ${decayInfo})`);
       }
 
       // Update cache instead of sending notifications
@@ -1062,21 +1244,40 @@ async function pollNostrOnce() {
         const blobbies = statusesByNpub.get(npub);
         if (!blobbies || blobbies.size === 0) continue;
 
-        // simple count logging
+        // Count using real stats with decay info
         let countBelow60 = 0, countBelow30 = 0;
-        for (const [, { statuses }] of blobbies) {
-          const { health, energy, hygiene, happiness, hunger, awake } = statuses;
+        const blobbiInfo = [];
+        for (const [blobbiId, { name, real, base, hoursSinceInteraction, stage }] of blobbies) {
+          const { health, energy, hygiene, happiness, hunger, awake } = real;
           const vals = [];
           if (health !== undefined) vals.push(health);
           if (energy !== undefined && awake !== false) vals.push(energy);
           if (hygiene !== undefined) vals.push(hygiene);
           if (happiness !== undefined) vals.push(happiness);
           if (hunger !== undefined) vals.push(hunger);
-          if (vals.some(v => v < 60)) countBelow60++;
-          if (vals.some(v => v < 30)) countBelow30++;
+          
+          const hasBelow60 = vals.some(v => v < 60);
+          const hasBelow30 = vals.some(v => v < 30);
+          
+          if (hasBelow60) countBelow60++;
+          if (hasBelow30) countBelow30++;
+          
+          // Collect blobbi info for logging
+          if (hasBelow60 || hasBelow30) {
+            blobbiInfo.push({
+              name,
+              hours: hoursSinceInteraction,
+              stage,
+              hasBelow60,
+              hasBelow30
+            });
+          }
         }
         if (countBelow60 > 0 || countBelow30 > 0) {
-          console.log(`📊 [poll] ${npub}: ${blobbies.size} blobbies | ${countBelow60} <60 | ${countBelow30} <30`);
+          const decayInfo = blobbiInfo
+            .map(b => `${b.name}(h=${b.hours?.toFixed(1)},s=${b.stage})`)
+            .join(', ');
+          console.log(`📊 [poll] ${npub}: ${blobbies.size} blobbies | ${countBelow60} <60 | ${countBelow30} <30 (computed with decay: ${decayInfo})`);
         }
 
         // Update cache instead of sending notifications

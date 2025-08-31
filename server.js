@@ -16,7 +16,7 @@ const VAPID_SUBJECT = process.env.VAPID_SUBJECT;
 const NOSTR_RELAYS = (process.env.NOSTR_RELAYS || "wss://relay.damus.io,wss://nostr.wine").split(",");
 const MONITOR_INTERVAL_MS =
   Number(process.env.MONITOR_INTERVAL_MS) ||
-  (process.env.DEBUG_MONITOR ? 60_000 : 30 * 60 * 1000);
+  (process.env.DEBUG_MONITOR ? 600_000 : 30 * 60 * 1000);
 
 // Rate limiting storage (in-memory)
 const lastSent = new Map(); // endpoint -> { messageKey -> timestamp }
